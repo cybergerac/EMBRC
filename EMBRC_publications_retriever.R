@@ -1,0 +1,303 @@
+# ============================================================
+# EMBRC_retrieve_publications.R
+# Bibliographic Analysis - Full Historical Fetch with Strict String Matching (2018 - 2026)
+# 
+# Christina Pavloudi
+# christina.pavloudi@embrc.eu
+# https://cpavloud.github.io/mysite/
+# 
+# Copyright (C) 2026 Christina Pavloudi
+# =============================================================
+
+################################################################################
+# LOAD LIBRARIES & SETUP OUTPUT DIRECTORY
+################################################################################
+
+.packages = c("httr", "jsonlite", "rcrossref", "dplyr", "purrr", "stringr")
+
+.inst <- .packages %in% installed.packages()
+if(length(.packages[!.inst]) > 0) install.packages(.packages[!.inst])
+
+lapply(.packages, require, character.only=TRUE)
+
+# Define the separate output folder name
+output_dir <- "output_csv"
+
+# Create the folder automatically if it doesn't exist yet
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir)
+}
+
+################################################################################
+# BUILD THE RETRIEVAL FUNCTION WITH STRICT MATCHING & XML/HTML TAG CLEANING
+################################################################################
+
+search_combined_literature <- function(
+    queries,
+    start_year = 2018,
+    end_year = 2026,
+    limit_per_query = 250,
+    sleep_time = 1
+) {
+  
+  # Text cleaning sub-function to remove HTML/XML tags, line breaks, tabs, and squish spaces
+  clean_text_field <- function(text_vector) {
+    if (is.null(text_vector)) return(NA)
+    # Remove any XML/HTML tags like <p>, </jats:p>, <i>, etc.
+    text_cleaned <- gsub("<[^>]+>", "", text_vector)
+    # Remove line breaks and tabs
+    text_cleaned <- gsub("[\r\n\t]+", " ", text_cleaned)
+    # Clean up XML entity codes
+    text_cleaned <- gsub("&amp;", "&", text_cleaned)
+    text_cleaned <- stringr::str_squish(text_cleaned)
+    return(text_cleaned)
+  }
+  
+  # -------------------------
+  # Semantic Scholar fetch
+  # -------------------------
+  fetch_semantic <- function(query) {
+    processed_query <- if(nchar(query) <= 8) paste0('"', query, '"') else query
+    
+    url <- paste0(
+      "https://api.semanticscholar.org/graph/v1/paper/search?",
+      "query=", URLencode(processed_query),
+      "&limit=", limit_per_query,
+      "&fields=title,year,authors,url,abstract,s2FieldsOfStudy"
+    )
+    
+    res <- GET(url)
+    Sys.sleep(sleep_time)
+    
+    if (status_code(res) != 200) return(NULL)
+    
+    data <- fromJSON(content(res, "text", encoding = "UTF-8"))
+    if (is.null(data$data)) return(NULL)
+    
+    df <- data$data %>%
+      mutate(
+        title = clean_text_field(title),
+        abstract = clean_text_field(abstract),
+        keywords = map_chr(s2FieldsOfStudy, ~{
+          if (is.null(.x) || length(.x) == 0) return(NA)
+          paste(.x$category, collapse = ", ")
+        }),
+        authors = map_chr(authors, ~paste(.x$name, collapse = ", ")),
+        doi = NA,
+        acknowledgements = NA,
+        source = "SemanticScholar",
+        query = query
+      ) %>%
+      select(title, year, authors, doi, url, source, query, abstract, keywords, acknowledgements)
+    
+    return(df)
+  }
+  
+  # -------------------------
+  # CrossRef fetch
+  # -------------------------
+  fetch_crossref <- function(query) {
+    res <- tryCatch({
+      cr_works(
+        query = query,
+        limit = limit_per_query,
+        filter = c(
+          from_pub_date = paste0(start_year, "-01-01"),
+          until_pub_date = paste0(end_year, "-12-31")
+        )
+      )
+    }, error = function(e) {
+      message(paste("Error with CrossRef query:", query, "-", e$message))
+      return(NULL)
+    })
+    
+    if (is.null(res) || is.null(res$data) || !is.data.frame(res$data) || nrow(res$data) == 0) return(NULL)
+    
+    if (!"abstract" %in% names(res$data)) res$data$abstract <- NA
+    if (!"funder" %in% names(res$data)) res$data$funder <- NA
+    
+    df <- res$data %>%
+      transmute(
+        title = clean_text_field(title),
+        year = as.numeric(substr(issued, 1, 4)),
+        authors = map_chr(author, ~{
+          if (is.null(.x)) return(NA)
+          paste(.x$family, collapse = ", ")
+        }),
+        doi = doi,
+        url = url,
+        source = "CrossRef",
+        query = query,
+        abstract = clean_text_field(abstract),
+        keywords = NA,
+        acknowledgements = map_chr(funder, ~{
+          if (is.null(.x) || !"name" %in% names(.x)) return(NA)
+          paste(.x$name, collapse = ", ")
+        })
+      )
+    
+    return(df)
+  }
+  
+  # -------------------------
+  # Run queries
+  # -------------------------
+  semantic_res <- map(queries, fetch_semantic) %>% bind_rows()
+  crossref_res <- map(queries, fetch_crossref) %>% bind_rows()
+  
+  combined <- bind_rows(semantic_res, crossref_res)
+  
+  if (nrow(combined) == 0) return(NULL)
+  
+  combined <- combined %>%
+    filter(!is.na(year) & year >= start_year & year <= end_year)
+  
+  # Strict substring validation
+  combined <- combined %>%
+    filter(
+      map2_lgl(query, title, ~str_detect(str_to_lower(.y), fixed(str_to_lower(.x)))) |
+        map2_lgl(query, abstract, ~{!is.na(.y) && str_detect(str_to_lower(.y), fixed(str_to_lower(.x)))}) |
+        map2_lgl(query, query, ~TRUE)
+    )
+  
+  combined <- combined %>%
+    mutate(title_clean = str_to_lower(title)) %>%
+    distinct(title_clean, .keep_all = TRUE) %>%
+    select(-title_clean)
+  
+  combined <- combined %>%
+    arrange(desc(year))
+  
+  return(combined)
+}
+
+################################################################################
+# DEFINE TARGET QUERIES BY REVISED INSTITUTIONAL CATEGORY
+################################################################################
+
+EMOBON_query <- c("ΕΜΟ ΒΟΝ", "EMOBON", "EMO-BON")
+
+EMBRC_HQ_query <- c("EMBRC", "EMBRC-ERIC", "European Marine Biological Resource Centre")
+
+EMBRC_nodes_query <- c(
+  "EMBRC-BE", "EMBRC-Belgium", "EMBRC Belgium", "EMBRC-ES", "EMBRC-Spain", 
+  "EMBRC Spain", "EMBRC-PT", "EMBRC-Portugal", "EMBRC.PT", "EMBRC Portugal", 
+  "ALG-01-0145-FEDER-022121", "FEDER022121", "EMBRC-GR", "EMBRC-Greece", "CMBR",
+  "EMBRC Greece", "EMBRC Sweden", "EMBRC-SE", "EMBRC-Sweden", "EMBRC-FR",
+  "EMBRC-France", "EMBRC France", "EMBRC Italy", "EMBRC-IT", "EMBRC-Italy",
+  "EMBRC Norway", "EMBRC-NO", "EMBRC-Norway", "EMBRC-FI", "EMBRC-Finland", 
+  "EMBRC Finland", "EMBRC Israel", "EMBRC-IL", "EMBRC-Israel", 
+  "EMBRC United Kingdom", "EMBRC-UK", "EMBRC-United Kingdom", "EMBRC UK"
+)
+
+ta_projects_query <- c(
+  "101058020", "AgroSERV", "AgroServ", "AGROSERV",
+  "101131121", "aquaSERV", "AQUASERV",
+  "101058620", "canSERV", "CanServ", "CANSERV",
+  "101046133", "ISIDORe", "ISIDORE",
+  "101131261", "IRISCC",
+  "101130915", "Aquarius", "AQUARIUS",
+  "652831", "AQUAEXCEL2020",
+  "871108", "AQUAEXCEL3.0", "AQUAEXCEL3",
+  "227799", "assemble marine", "ASSEMBLE Marine",
+  "730984", "assemble plus", "ASSEMBLE Plus",
+  "101291041", "ACCESS2ACCESS",
+  "101291351", "RISE-UP BIO", "RISE-UP",
+  "101292665", "SIRENE",
+  "654008", "EMBRIC",
+  "654248", "CORBEL"
+)
+
+coordination_query <- c(
+  "101112800", "eDNAquaPlan", "eDNAquaplan", "eDNAqua-plan",
+  "101082021", "MARCO-BOLO", "MARCO BOLO"
+)
+
+preparation_query <- c(
+  "262280", "ppEMBRC", "ppEMBRC",
+  "689173", "pp2EMBRC", "pp2EMBRC"
+)
+
+collaboration_query <- c(
+  "654182", "ENVRIPlus", "ENVRIplus",
+  "824063", "RI-VIS", "RIVIS",
+  "823798", "ERIC Forum", "ERIC forum",
+  "EAPA_501/2016", "EBB", "European Blue Biobank",
+  "824087", "EOSC-Life", "EOSC-life",
+  "101017536", "EOSC-Future", "EOSC-future",
+  "101000518", "DOORs", "DOORs-BlackSea",
+  "862923", "AtlantECO",
+  "101057970", "Al4LIFE", "AI4LIFE",
+  "101058785", "FAIR EASE", "FAIR-EASE",
+  "101094227", "Bluecloud2026", "Blue-Cloud",
+  "101059915", "BioOcean5D", "BioOcean5D",
+  "101082304", "Blueremediomics", "BlueRemediomics",
+  "101094924", "ANERIS",
+  "101131663", "EUREMAP",
+  "101112823", "DTO-Bioflow", "DTO-Bioflow",
+  "101124559", "ERIC FORUM 2", "ERIC Forum 2",
+  "101094250", "IMAGINE",
+  "101188028", "TRICUSO",
+  "101188201", "MALDIBANK"
+)
+
+################################################################################
+# RETRIEVAL AND EXTRACTION (HISTORICAL ARCHIVE 2018 - 2026)
+################################################################################
+
+message("Starting data retrieval for EMOBON...")
+EMOBON_papers <- search_combined_literature(EMOBON_query, start_year = 2018, end_year = 2026)
+if(!is.null(EMOBON_papers) && nrow(EMOBON_papers) > 0) {
+  EMOBON_papers <- EMOBON_papers %>% mutate(reference = "EMOBON")
+}
+
+message("Starting data retrieval for EMBRC HQ...")
+EMBRC_HQ_papers <- search_combined_literature(EMBRC_HQ_query, start_year = 2018, end_year = 2026)
+if(!is.null(EMBRC_HQ_papers) && nrow(EMBRC_HQ_papers) > 0) {
+  EMBRC_HQ_papers <- EMBRC_HQ_papers %>% mutate(reference = "EMBRC_HQ")
+}
+
+message("Starting data retrieval for EMBRC National Nodes...")
+EMBRC_nodes_papers <- search_combined_literature(EMBRC_nodes_query, start_year = 2018, end_year = 2026)
+if(!is.null(EMBRC_nodes_papers) && nrow(EMBRC_nodes_papers) > 0) {
+  EMBRC_nodes_papers <- EMBRC_nodes_papers %>% mutate(reference = "EMBRC_Nodes")
+}
+
+message("Starting data retrieval for EMBRC Transnational Access Projects...")
+EMBRC_TA_projects <- search_combined_literature(ta_projects_query, start_year = 2018, end_year = 2026)
+if(!is.null(EMBRC_TA_projects) && nrow(EMBRC_TA_projects) > 0) {
+  EMBRC_TA_projects <- EMBRC_TA_projects %>% mutate(reference = "EMBRC_TA_projects")
+}
+
+message("Starting data retrieval for EMBRC Coordination...")
+EMBRC_coordination <- search_combined_literature(coordination_query, start_year = 2018, end_year = 2026)
+if(!is.null(EMBRC_coordination) && nrow(EMBRC_coordination) > 0) {
+  EMBRC_coordination <- EMBRC_coordination %>% mutate(reference = "EMBRC_coordination")
+}
+
+message("Starting data retrieval for EMBRC Preparation...")
+EMBRC_preparation <- search_combined_literature(preparation_query, start_year = 2018, end_year = 2026)
+if(!is.null(EMBRC_preparation) && nrow(EMBRC_preparation) > 0) {
+  EMBRC_preparation <- EMBRC_preparation %>% mutate(reference = "EMBRC_preparation")
+}
+
+message("Starting data retrieval for EMBRC Collaboration...")
+EMBRC_collaboration <- search_combined_literature(collaboration_query, start_year = 2018, end_year = 2026)
+if(!is.null(EMBRC_collaboration) && nrow(EMBRC_collaboration) > 0) {
+  EMBRC_collaboration <- EMBRC_collaboration %>% mutate(reference = "EMBRC_collaboration")
+}
+
+################################################################################
+# SAVE RESULTS AS STANDARDIZED CSV FILES INSIDE OUTPUT FOLDER
+################################################################################
+
+write.csv(EMOBON_papers, file.path(output_dir, "EMOBON_papers.csv"), row.names = FALSE)
+write.csv(EMBRC_HQ_papers, file.path(output_dir, "EMBRC_HQ_papers.csv"), row.names = FALSE)
+write.csv(EMBRC_nodes_papers, file.path(output_dir, "EMBRC_nodes_papers.csv"), row.names = FALSE)
+write.csv(EMBRC_TA_projects, file.path(output_dir, "EMBRC_TA_projects.csv"), row.names = FALSE)
+write.csv(EMBRC_coordination, file.path(output_dir, "EMBRC_coordination.csv"), row.names = FALSE)
+write.csv(EMBRC_preparation, file.path(output_dir, "EMBRC_preparation.csv"), row.names = FALSE)
+write.csv(EMBRC_collaboration, file.path(output_dir, "EMBRC_collaboration.csv"), row.names = FALSE)
+
+save.image("Retrieve_publications.RData")
+message("Historical extraction complete! Cleaned CSV files saved inside 'output_csv/'.")
