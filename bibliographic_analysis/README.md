@@ -4,7 +4,7 @@ This repository contains the modular data pipeline designed for the European Res
 
 The toolkit is engineered to provide structured data exports that fulfill the key performance indicators (**KPIs**) required by **ESFRI monitoring cycles**, while fully respecting modern **Open Science** and **DORA** assessment principles through integrated alternative metric signals.
 
-> ℹ️ **Lineage Note:** This tool is an evolution and adaptation of the original code developed by Christina Pavloudi, rewritten to support the new institutional classification and native Altmetrics enrichment without depending on archived external libraries.
+> ℹ️ **Lineage Note:** This tool is an evolution and adaptation of the original code developed by Christina Pavloudi, rewritten to support the new institutional classification and native Altmetrics enrichment without depending on archived external libraries. Source file is here: https://github.com/cpavloud/retrieve_publications/blob/main/Retrieve_publications.R
 
 ---
 
