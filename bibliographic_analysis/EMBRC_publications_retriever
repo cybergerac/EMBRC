@@ -1,12 +1,16 @@
 # ============================================================
 # EMBRC_retrieve_publications.R
 # Bibliographic Analysis - Full Historical Fetch with Strict String Matching (2018 - 2026)
+
+# ==============================================================================
+# This tool is an evolution and adaptation of the original code developed by 
+# Christina Pavloudi, rewritten to support institutional classification and Altmetrics enrichment.
+# source file: https://github.com/cpavloud/retrieve_publications/blob/main/Retrieve_publications.R
+# ==============================================================================
 # 
-# Christina Pavloudi
-# christina.pavloudi@embrc.eu
-# https://cpavloud.github.io/mysite/
+# Davide Di Cioccio
+# davide.dicioccio@embrc.eu
 # 
-# Copyright (C) 2026 Christina Pavloudi
 # =============================================================
 
 ################################################################################
